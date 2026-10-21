@@ -1,0 +1,201 @@
+/**
+ * NDTI over water, Sentinel-2 (winter 2023-24)
+ *
+ * Purpose: Interactive slider to view NDTI over water beside a true-color
+ *          background, plus an NDTI time series for a point on the water.
+ * Data:    COPERNICUS/S2_SR_HARMONIZED, SCL-based cloud/snow masking
+ * Method:  NDTI  = (B4 - B3) / (B4 + B3)   (Lacaux et al., 2007)
+ *          Water = NDWI > WATER_THRESHOLD, NDWI = (B3 - B8) / (B3 + B8)
+ *                  (McFeeters, 1996)
+ * Run:     Paste into the Google Earth Engine Code Editor and click Run.
+ *          No imports or private assets are needed.
+ */
+
+// ============================================================
+// 1. Parameters (edit these)
+// ============================================================
+
+var START_DATE = '2023-12-01';
+var END_DATE = '2024-03-01';
+
+// Center of the study site (lon, lat)
+var AOI = ee.Geometry.Point([-80.5645, 37.1982]);
+
+// Point used for the time series (here, a sample site in the middle of the river).
+// Replace with any ee.Geometry.Point, or a polygon to get an area mean.
+var POI = AOI;
+
+// Pixels with NDWI above this are treated as water.
+// Raise (0.1 to 0.2) if land leaks into the mask; lower if water edges vanish.
+var WATER_THRESHOLD = 0;
+
+// Drop scenes with more than this % cloud cover over the whole S2 tile
+// (set to 100 to disable). Cloud pixels are also masked individually via SCL below,
+// so this mainly removes hazy, noisy scenes. Tile-wide, so it may drop scenes
+// that are clear over the study site.
+var CLOUD_MAX = 70;
+
+// ============================================================
+// 2. Sentinel-2 filtering and masking
+// ============================================================
+
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR_HARMONIZED');
+
+var s2Filtered = S2
+  .filterDate(START_DATE, END_DATE)
+  .filterBounds(AOI)
+  .filter(ee.Filter.lte('CLOUDY_PIXEL_PERCENTAGE', CLOUD_MAX));
+
+// Keep only SCL classes of interest; this removes clouds, snow, and shadows.
+//   2 = dark area pixels, 4 = vegetation, 5 = bare soil, 6 = water
+function maskCloudsAndSnow(img) {
+  var scl = img.select('SCL');
+  var keep = scl.eq(2).or(scl.eq(4)).or(scl.eq(5)).or(scl.eq(6));
+  return img.updateMask(keep);
+}
+
+var sentinel = s2Filtered.map(maskCloudsAndSnow);
+
+// ============================================================
+// 3. Indices: NDWI (water) and NDTI (turbidity)
+// ============================================================
+
+function addIndices(img) {
+  var ndwi = img.normalizedDifference(['B3', 'B8']).rename('NDWI');
+  var ndti = img.normalizedDifference(['B4', 'B3']).rename('NDTI');
+  return img.addBands(ndwi).addBands(ndti);
+}
+
+var processed = sentinel.map(addIndices);
+
+// Returns NDTI with non-water pixels masked out (no new band is stored).
+function ndtiOverWater(img) {
+  return img.select('NDTI').updateMask(img.select('NDWI').gt(WATER_THRESHOLD));
+}
+
+// ============================================================
+// 4. Visualization parameters
+// ============================================================
+
+var trueColorVis = {
+  bands: ['B4', 'B3', 'B2'],
+  min: 0,
+  max: 3000,
+  gamma: 1.2
+};
+
+// Range may change from site to site; check it against the layer's values.
+var ndtiVis = {
+  min: -0.5,
+  max: 0.1,
+  palette: ['4112ff', '0affff', '10ff17', 'fbff00', 'ffa604', 'ff0000']
+};
+
+Map.centerObject(AOI, 14);
+
+// ============================================================
+// 5. Interactive slider: NDTI over water + true color
+// ============================================================
+// Note: if two image tiles cover the AOI on the same day, that date will
+// appear twice in the slider. Mosaic by date if this matters for your site.
+
+var imageList = processed.toList(processed.size());
+
+// Dates are fetched client-side so they can label the slider.
+var dates = imageList.map(function(img) {
+  return ee.Date(ee.Image(img).get('system:time_start')).format('YYYY-MM-dd');
+}).getInfo();
+
+var dateLabel = ui.Label('Date: ' + dates[0]);
+
+// References to the layers currently on the map, so they can be removed.
+var currentTrueColor = null;
+var currentNdti = null;
+
+function showDate(index) {
+  var img = ee.Image(imageList.get(index));
+  var date = dates[index];
+
+  // Remove the previous date's layers
+  if (currentTrueColor) Map.layers().remove(currentTrueColor);
+  if (currentNdti) Map.layers().remove(currentNdti);
+
+  currentTrueColor = ui.Map.Layer(img, trueColorVis, 'True Color - ' + date);
+  currentNdti = ui.Map.Layer(ndtiOverWater(img), ndtiVis, 'NDTI - ' + date);
+
+  // Add true color first so NDTI draws on top
+  Map.layers().add(currentTrueColor);
+  Map.layers().add(currentNdti);
+
+  dateLabel.setValue('Date: ' + date);
+}
+
+var slider = ui.Slider({
+  min: 0,
+  max: dates.length - 1,
+  step: 1,
+  value: 0,
+  style: {stretch: 'horizontal'},
+  onChange: showDate
+});
+
+var panel = ui.Panel({
+  widgets: [
+    ui.Label('NDTI + True Color (Slider)', {fontWeight: 'bold', fontSize: '16px'}),
+    dateLabel,
+    slider
+  ],
+  style: {width: '300px', position: 'top-right'}
+});
+Map.add(panel);
+
+// Show the first date through the same code path as the slider
+showDate(0);
+
+// ============================================================
+// 6. Legend for NDTI
+// ============================================================
+
+var legend = ui.Panel({style: {position: 'bottom-left', padding: '8px 15px'}});
+legend.add(ui.Label('NDTI', {fontWeight: 'bold', fontSize: '18px'}));
+
+var gradient = ee.Image.pixelLonLat().select('latitude')
+  .multiply((ndtiVis.max - ndtiVis.min) / 100.0)
+  .add(ndtiVis.min)
+  .visualize(ndtiVis);
+
+legend.add(ui.Panel([ui.Label(String(ndtiVis.max))]));
+legend.add(ui.Thumbnail({
+  image: gradient,
+  params: {bbox: '0,0,10,100', dimensions: '10x200'},
+  style: {padding: '1px', position: 'bottom-center'}
+}));
+legend.add(ui.Panel([ui.Label(String(ndtiVis.min))]));
+Map.add(legend);
+
+// ============================================================
+// 7. Chart: mean NDTI over water through time
+// ============================================================
+
+// Collection of water-masked NDTI images (keeps each image's date)
+var ndtiWaterCollection = processed.map(ndtiOverWater);
+
+var ndtiChart = ui.Chart.image.series({
+  imageCollection: ndtiWaterCollection,
+  region: POI,
+  reducer: ee.Reducer.mean(),
+  scale: 10,
+  xProperty: 'system:time_start'
+})
+  .setChartType('ScatterChart')
+  .setOptions({
+    title: 'NDTI at river sample site (Dec 2023 to Feb 2024)',
+    hAxis: {title: 'Date', format: 'MMM yyyy'},
+    vAxis: {title: 'NDTI'},
+    pointSize: 5,
+    lineWidth: 0,
+    colors: ['blue'],
+    legend: {position: 'none'}
+  });
+
+print(ndtiChart);
